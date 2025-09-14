@@ -13,12 +13,6 @@ Session = sessionmaker(bind=engine)
 Base = declarative_base()
 
 # ----------------------------
-# Many-to-many associations
-# ----------------------------
-
-mapping_schema_domain = Table( "mapping_schema_domain", Base.metadata, Column("mapping_schema_id", Integer, ForeignKey("mapping_schema.id", ondelete="CASCADE"), primary_key=True), Column("sdtm_domain_id", Integer, ForeignKey("sdtm_domain.id", ondelete="CASCADE"), primary_key=True))
-
-# ----------------------------
 # Core Models
 # ----------------------------
 
@@ -31,6 +25,17 @@ class Project(Base):
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
     source_files = relationship("SourceFile", back_populates="project")
     mapping_schemas = relationship("MappingSchema", back_populates="project")
+
+    source_files = relationship(
+        "SourceFile",
+        back_populates="project",
+        passive_deletes=True,          # <--- add this
+    )
+    mapping_schemas = relationship(
+        "MappingSchema",
+        back_populates="project",
+        passive_deletes=True,          # <--- add this
+    )
 
 
 class SourceFile(Base):
@@ -69,12 +74,22 @@ class SourceColumn(Base):
     name = Column(Text, nullable=False)
     data_type = Column(Text)
     ordinal = Column(Integer)
-    sample_values = Column(ARRAY(Text))
-    variant = Column(Text, default="raw")
     created_at = Column(DateTime, server_default=func.now())
     description = Column(Text)
 
+    # relationships
     source_file = relationship("SourceFile", back_populates="source_columns")
+    data_cells = relationship(
+        "SourceData",
+        back_populates="column",
+        passive_deletes=True,
+        lazy="noload",
+    )
+
+    __table_args__ = (
+        UniqueConstraint("source_file_id", "name", name="uq_source_column_per_file"),
+        Index("ix_source_column_file_ord", "source_file_id", "ordinal"),
+    )
 
 
 class SourceData(Base):
@@ -82,10 +97,22 @@ class SourceData(Base):
     id = Column(Integer, primary_key=True)
     source_file_id = Column(Integer, ForeignKey("source_file.id", ondelete="CASCADE"), nullable=False)
     row_index = Column(Integer, nullable=False)
-    column_name = Column(Text, nullable=False)
     value = Column(Text)
-    variant = Column(Text, default="raw")
+    source_column_id = Column(Integer, ForeignKey("source_column.id", ondelete="CASCADE"), nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
+
+    # relationships
     source_file = relationship("SourceFile", back_populates="source_datas")
+    column = relationship("SourceColumn", back_populates="data_cells")
+
+    __table_args__ = (
+        # one cell per row per column
+        UniqueConstraint("row_index", "source_column_id", name="uq_source_cell_by_colid"),
+        Index("ix_source_data_file_row", "source_file_id", "row_index"),
+        Index("ix_source_data_source_column", "source_column_id"),
+        Index("ix_source_data_file_col_row", "source_file_id", "source_column_id", "row_index"),
+        Index("ix_source_data_created_at", "created_at"),
+    )
 
 
 class MappingSchema(Base):
@@ -106,7 +133,8 @@ class MappingSchema(Base):
 
     # convenient view-only many-to-many
     source_files = relationship("SourceFile", secondary=lambda: MappingSchemaSourceFile.__table__, back_populates="mapping_schemas", viewonly=True)
-    domains = relationship("SDTMDomain", secondary=mapping_schema_domain, back_populates="mapping_schemas")
+
+    sdtm_columns = relationship("SDTMColumn", back_populates="mapping_schema", cascade="all, delete-orphan", passive_deletes=True)
 
 
 class MappingSchemaSourceFile(Base):
@@ -125,26 +153,49 @@ class MappingSchemaSourceFile(Base):
     source_file = relationship("SourceFile", back_populates="mapping_schema_links")
 
 
-class SDTMData(Base):
-    __tablename__ = "sdtm_data"
-    id = Column(Integer, primary_key=True)
-    domain = Column(Text, nullable=False)
-    row_index = Column(Integer, nullable=False)
-    column_name = Column(Text, nullable=False)
-    value = Column(Text)
-    source_file_id = Column(Integer, ForeignKey("source_file.id", ondelete="CASCADE"), nullable=True)
-    mapping_schema_id = Column(Integer, ForeignKey("mapping_schema.id", ondelete="CASCADE"), nullable=False)
-
-
 class SDTMColumn(Base):
     __tablename__ = "sdtm_column"
-    id = Column(Integer, primary_key=True)
-    domain = Column(Text, nullable=False)
-    name = Column(Text, nullable=False)
-    data_type = Column(Text)
-    ordinal = Column(Integer)
-    source_file_id = Column(Integer, ForeignKey("source_file.id", ondelete="CASCADE"), nullable=False)
-    mapping_schema_id = Column(Integer, ForeignKey("mapping_schema.id", ondelete="CASCADE"), nullable=False)
+    id               = Column(Integer, primary_key=True)
+    mapping_schema_id= Column(Integer, ForeignKey("mapping_schema.id", ondelete="CASCADE"), nullable=False)
+    source_file_id   = Column(Integer, ForeignKey("source_file.id",    ondelete="CASCADE"), nullable=False)
+    sdtm_variable_id = Column(Integer, ForeignKey("sdtm_variable.id",  ondelete="CASCADE"), nullable=False)
+    created_at       = Column(DateTime, server_default=func.now(), nullable=False)
+
+    mapping_schema = relationship("MappingSchema", back_populates="sdtm_columns")
+    source_file    = relationship("SourceFile")
+    variable       = relationship("SDTMVariable")
+    
+    data_cells = relationship(
+        "SDTMData",
+        back_populates="column",
+        passive_deletes=True,
+        lazy="noload"
+    )
+
+    __table_args__ = (
+        UniqueConstraint("mapping_schema_id", "source_file_id", "sdtm_variable_id",
+                         name="uq_sdtm_col_per_schema_file_var"),
+        Index("ix_sdtm_col_schema_file", "mapping_schema_id", "source_file_id"),
+        Index("ix_sdtm_col_var", "sdtm_variable_id"),
+        Index("ix_sdtm_col_schema_file_var", "mapping_schema_id", "source_file_id", "sdtm_variable_id"),
+    )
+
+
+class SDTMData(Base):
+    __tablename__ = "sdtm_data"
+    id             = Column(Integer, primary_key=True)
+    row_index      = Column(Integer, nullable=False)
+    value          = Column(Text)
+    created_at     = Column(DateTime, server_default=func.now(), nullable=False)
+
+    sdtm_column_id = Column(Integer, ForeignKey("sdtm_column.id", ondelete="CASCADE"), nullable=False)
+    column = relationship("SDTMColumn", back_populates="data_cells")
+
+    __table_args__ = (
+        UniqueConstraint("row_index", "sdtm_column_id", name="uq_sdtm_cell_by_colid"),
+        Index("ix_sdtm_data_col_row", "sdtm_column_id", "row_index"),
+        Index("ix_sdtm_data_col", "sdtm_column_id"),
+    )
 
 
 class SDTMStandard(Base):
@@ -212,11 +263,6 @@ class SDTMDomain(Base):
     #relationships
     standard = relationship("SDTMStandard", back_populates="domains")
     variables = relationship("SDTMVariable", back_populates="domain", cascade="all, delete")
-    mapping_schemas = relationship(
-        "MappingSchema",
-        secondary=mapping_schema_domain,
-        back_populates="domains"
-    )
 
 
 class SDTMVariable(Base):

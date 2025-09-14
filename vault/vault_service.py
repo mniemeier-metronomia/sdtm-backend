@@ -84,20 +84,21 @@ class VaultService:
 
             # Delete large object
             if source_file.file_oid:
-                with raw_conn.cursor() as cursor:
-                    try:
-                        raw_conn.lobject(source_file.file_oid).unlink()
-                    except Exception:
-                        pass
+                try:
+                    raw_conn.lobject(source_file.file_oid).unlink()
+                    raw_conn.commit()  # <-- IMPORTANT: commit the LO unlink
+                except Exception:
+                    raw_conn.rollback()
+                    # ignore missing LO or log it
 
             session.delete(source_file)
             session.commit()
             return True
         except Exception as e:
-            print(f"Error: {e}")
             session.rollback()
             raw_conn.rollback()
             raise
         finally:
             raw_conn.close()
             session.close()
+

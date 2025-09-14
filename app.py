@@ -14,6 +14,9 @@ app.register_blueprint(source_files_bp)
 from project.project_routes import project_bp
 app.register_blueprint(project_bp)
 
+from mapping_schemas.mapping_schemas_routes import mapping_schema_bp
+app.register_blueprint(mapping_schema_bp)
+
 from sdtm.sdtm_routes import sdtm_bp
 app.register_blueprint(sdtm_bp)
 

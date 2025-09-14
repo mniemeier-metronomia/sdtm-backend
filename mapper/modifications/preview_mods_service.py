@@ -55,7 +55,7 @@ class PreviewModsService:
     def _col_types_map(self, session, source_file_id: int):
         rows = (
             session.query(SourceColumn.name, SourceColumn.data_type)
-            .filter_by(source_file_id=source_file_id, variant="raw")
+            .filter_by(source_file_id=source_file_id)
             .all()
         )
         return {name: dtype for (name, dtype) in rows}
@@ -64,10 +64,7 @@ class PreviewModsService:
         # sample row_index deterministically
         row_idx_stmt = (
             select(distinct(SourceData.row_index))
-            .where(
-                SourceData.source_file_id == source_file_id,
-                getattr(SourceData, "variant", "raw") == "raw" if hasattr(SourceData, "variant") else True,
-            )
+            .where(SourceData.source_file_id == source_file_id)
             .order_by(asc(SourceData.row_index))
             .limit(max_rows)
         )
@@ -82,7 +79,6 @@ class PreviewModsService:
             select(SourceData.row_index, SourceData.column_name, SourceData.value)
             .where(
                 SourceData.source_file_id == source_file_id,
-                getattr(SourceData, "variant", "raw") == "raw" if hasattr(SourceData, "variant") else True,
                 SourceData.column_name.in_(needed_cols),
                 SourceData.row_index.in_(idx),
             )

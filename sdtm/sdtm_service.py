@@ -1,6 +1,8 @@
 import pandas as pd
-from db import Session, SDTMDomain, SDTMData, SDTMColumn, SDTMStandard, SDTMVariable
-from sqlalchemy import and_, or_, func, distinct, cast, Integer, Float, Boolean, DateTime
+from collections import defaultdict
+from db import Session, SDTMDomain, SDTMData, SDTMColumn, SDTMStandard, SDTMVariable, MappingSchema, MappingSchemaSourceFile
+from sqlalchemy import and_, or_, tuple_, distinct, cast, Float
+from sqlalchemy.sql import func
 from source_files.source_files_utilities import SourceFilesUtilities
 
 
@@ -142,8 +144,8 @@ class SDTMService:
     def get_sdtm_data(
         self,
         domain,
-        source_file_id=None,
-        mapping_schema_id=None,
+        mapping_schema_id,              # required
+        source_file_id=None,            # optional; if None, stack rows across all files
         offset=0,
         limit=100,
         sort_by=None,
@@ -152,154 +154,220 @@ class SDTMService:
     ):
         session = Session()
         try:
-            # ---------- columns (prefer SDTMColumn) ----------
-            col_q = session.query(SDTMColumn).filter(SDTMColumn.domain == domain)
-            if mapping_schema_id:
-                col_q = col_q.filter(SDTMColumn.mapping_schema_id == mapping_schema_id)
+            dom = (domain or "").upper().strip()
+            if not dom:
+                return {"error": "domain required"}, 400
+            if mapping_schema_id is None:
+                return {"error": "mapping_schema_id required"}, 400
+
+            # ---------- load headers for scope (optionally across all files) ----------
+            hdr_q = (
+                session.query(
+                    SDTMColumn.id.label("col_id"),
+                    SDTMColumn.source_file_id.label("sfid"),
+                    SDTMVariable.name.label("var_name"),
+                    SDTMVariable.data_type.label("ig_type"),         # "Char"/"Num"
+                    SDTMVariable.variable_order.label("var_order"),
+                )
+                .join(SDTMVariable, SDTMVariable.id == SDTMColumn.sdtm_variable_id)
+                .join(SDTMDomain, SDTMDomain.id == SDTMVariable.domain_id)
+                .filter(
+                    SDTMColumn.mapping_schema_id == mapping_schema_id,
+                    SDTMDomain.name == dom,
+                )
+            )
             if source_file_id is not None:
-                col_q = col_q.filter(SDTMColumn.source_file_id == source_file_id)
-            col_q = col_q.order_by(SDTMColumn.ordinal.asc().nullsfirst(), SDTMColumn.name.asc())
-            col_rows = col_q.all()
+                hdr_q = hdr_q.filter(SDTMColumn.source_file_id == source_file_id)
 
-            if col_rows:
-                cols = [
-                    {
-                        "name": c.name,
-                        "data_type": (c.data_type or "text").lower(),
-                        "nullable": True,
-                        "ordinal": c.ordinal,
-                    }
-                    for c in col_rows
-                ]
-                col_order = [c.name for c in col_rows]
-                name_to_dtype = {c.name: (c.data_type or "text").lower() for c in col_rows}
-            else:
-                # Fallback: infer columns from data scope
-                colnames_q = session.query(SDTMData.column_name).filter(SDTMData.domain == domain)
-                if mapping_schema_id:
-                    colnames_q = colnames_q.filter(SDTMData.mapping_schema_id == mapping_schema_id)
-                if source_file_id is not None:
-                    colnames_q = colnames_q.filter(SDTMData.source_file_id == source_file_id)
-                colnames = sorted({r.column_name for r in colnames_q.distinct().all()})
-                cols = [{"name": n, "data_type": "text", "nullable": True, "ordinal": i} for i, n in enumerate(colnames)]
-                col_order = colnames
-                name_to_dtype = {n: "text" for n in colnames}
+            hdr_rows = hdr_q.order_by(SDTMVariable.variable_order.asc(), SDTMVariable.name.asc()).all()
+            if not hdr_rows:
+                return {"cols": [], "rows": [], "total": 0}, 200
 
-            # Guard: unknown sort_by -> disable sorting
+            # Deduplicate columns by variable name (IG), keep IG order & dtype
+            var_meta_by_name = {}
+            col_ids_by_var = {}     # var_name -> set(col_id across files)
+            sfids = set()
+            for r in hdr_rows:
+                sfids.add(r.sfid)
+                if r.var_name not in var_meta_by_name:
+                    dt = "num" if (r.ig_type or "").lower().startswith("num") else "char"
+                    var_meta_by_name[r.var_name] = {"ordinal": r.var_order, "data_type": dt}
+                col_ids_by_var.setdefault(r.var_name, set()).add(r.col_id)
+
+            # Build final ordered column list by IG order
+            ordered_vars = sorted(var_meta_by_name.keys(), key=lambda n: var_meta_by_name[n]["ordinal"])
+            cols = [
+                {
+                    "name": vn,
+                    "data_type": var_meta_by_name[vn]["data_type"],
+                    "nullable": True,
+                    "ordinal": var_meta_by_name[vn]["ordinal"],
+                }
+                for vn in ordered_vars
+            ]
+            name_to_dtype = {vn: var_meta_by_name[vn]["data_type"] for vn in ordered_vars}
+
+            # guard sort_by
             if sort_by and sort_by not in name_to_dtype:
                 sort_by = None
 
-            # ---------- normalize filters (AND across columns, case-insensitive contains) ----------
+            # ---------- filters: AND across variables, case-insensitive contains ----------
             filters = filters or []
             active_filters = []
             for f in filters:
                 if not f:
                     continue
-                col = f.get("col")
+                vn = f.get("col")
                 text = str(f.get("filter_text", "")).strip()
-                if not col or col not in name_to_dtype or text == "":
+                if not vn or vn not in name_to_dtype or text == "":
                     continue
-                active_filters.append({"col": col, "text": text})
+                active_filters.append({"var_name": vn, "text": text})
 
             def _escape_like(s: str) -> str:
-                # escape %, _ and \ for LIKE/ILIKE
                 return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
-            # Build filtered row subquery (rows must match ALL filters)
-            # ((col=a AND value ILIKE %x%) OR (col=b AND value ILIKE %y%) ...)
-            # GROUP BY row_index HAVING COUNT(DISTINCT column_name) = N_filters
-            filtered_rows_subq = None
+            # Subquery of matching (sfid, row_index) if filters are present.
+            # We match by variable NAME (join to SDTMVariable) so the logic works across files.
+            filtered_keys_subq = None
             if active_filters:
-                base_scope = session.query(SDTMData).filter(SDTMData.domain == domain)
-                if mapping_schema_id:
-                    base_scope = base_scope.filter(SDTMData.mapping_schema_id == mapping_schema_id)
-                if source_file_id is not None:
-                    base_scope = base_scope.filter(SDTMData.source_file_id == source_file_id)
-
                 or_clauses = []
                 for f in active_filters:
                     pattern = f"%{_escape_like(f['text'])}%"
-                    or_clauses.append(and_(SDTMData.column_name == f["col"], SDTMData.value.ilike(pattern, escape="\\")))
-
-                filtered_rows_q = (
-                    base_scope.filter(or_(*or_clauses))
-                    .with_entities(SDTMData.row_index)
-                    .group_by(SDTMData.row_index)
-                    .having(func.count(func.distinct(SDTMData.column_name)) == len(active_filters))
+                    or_clauses.append(and_(
+                        SDTMVariable.name == f["var_name"],
+                        SDTMData.value.ilike(pattern, escape="\\"),
+                    ))
+                filtered_keys_q = (
+                    session.query(
+                        SDTMColumn.source_file_id.label("sfid"),
+                        SDTMData.row_index.label("ri"),
+                    )
+                    .join(SDTMVariable, SDTMVariable.id == SDTMColumn.sdtm_variable_id)
+                    .join(SDTMDomain, SDTMDomain.id == SDTMVariable.domain_id)
+                    .join(SDTMData, SDTMData.sdtm_column_id == SDTMColumn.id)
+                    .filter(
+                        SDTMColumn.mapping_schema_id == mapping_schema_id,
+                        SDTMDomain.name == dom,
+                    )
+                    .filter(or_(*or_clauses))
+                    .group_by(SDTMColumn.source_file_id, SDTMData.row_index)
+                    .having(func.count(func.distinct(SDTMVariable.name)) == len(active_filters))
                 )
-                filtered_rows_subq = filtered_rows_q.subquery()
+                if source_file_id is not None:
+                    filtered_keys_q = filtered_keys_q.filter(SDTMColumn.source_file_id == source_file_id)
+                filtered_keys_subq = filtered_keys_q.subquery()
 
-            # ---------- row indices (respect filters; optional sort) ----------
+            # ---------- determine row keys (sfid, ri) with paging & optional sort ----------
+            row_keys = []  # list of (sfid, ri)
             if sort_by:
-                dtype = name_to_dtype.get(sort_by, "text")
-                sort_expr = SDTMData.value
-                if dtype in ("int", "integer"):
-                    sort_expr = cast(SDTMData.value, Integer)
-                elif dtype in ("float", "decimal", "double", "numeric"):
-                    sort_expr = cast(SDTMData.value, Float)
-                elif dtype in ("datetime", "timestamp", "date"):
-                    sort_expr = cast(SDTMData.value, DateTime)
-                elif dtype in ("bool", "boolean"):
-                    sort_expr = cast(SDTMData.value, Boolean)
-
+                # Build a cross-file sort using values for the chosen variable name
+                sort_ids = list(col_ids_by_var.get(sort_by, []))  # all column ids for this var across files
+                sort_dtype = name_to_dtype.get(sort_by, "char")
+                sort_expr = SDTMData.value if sort_dtype == "char" else cast(SDTMData.value, Float)
                 sort_order = sort_expr.desc().nullslast() if sort_dir == "desc" else sort_expr.asc().nullsfirst()
 
-                ri_q = session.query(SDTMData.row_index).filter(SDTMData.domain == domain, SDTMData.column_name == sort_by)
-                if mapping_schema_id:
-                    ri_q = ri_q.filter(SDTMData.mapping_schema_id == mapping_schema_id)
-                if source_file_id is not None:
-                    ri_q = ri_q.filter(SDTMData.source_file_id == source_file_id)
-                if filtered_rows_subq is not None:
-                    ri_q = ri_q.filter(SDTMData.row_index.in_(filtered_rows_subq))
-
-                row_indices = [
-                    r.row_index
-                    for r in ri_q.order_by(sort_order, SDTMData.row_index.asc()).offset(offset).limit(limit).all()
-                ]
+                rk_q = (
+                    session.query(
+                        SDTMColumn.source_file_id.label("sfid"),
+                        SDTMData.row_index.label("ri"),
+                    )
+                    .join(SDTMData, SDTMData.sdtm_column_id == SDTMColumn.id)
+                    .filter(SDTMColumn.id.in_(sort_ids))
+                )
+                if filtered_keys_subq is not None:
+                    rk_q = rk_q.join(
+                        filtered_keys_subq,
+                        and_(
+                            filtered_keys_subq.c.sfid == SDTMColumn.source_file_id,
+                            filtered_keys_subq.c.ri == SDTMData.row_index,
+                        ),
+                    )
+                # Stable secondary key to keep rows grouped by file then row_index
+                rk_q = rk_q.order_by(sort_order, SDTMColumn.source_file_id.asc(), SDTMData.row_index.asc())
+                rk_q = rk_q.offset(offset).limit(limit)
+                row_keys = [(r.sfid, r.ri) for r in rk_q.all()]
             else:
-                ri_q = session.query(SDTMData.row_index).filter(SDTMData.domain == domain)
-                if mapping_schema_id:
-                    ri_q = ri_q.filter(SDTMData.mapping_schema_id == mapping_schema_id)
+                # Default: order by file then row_index (stack vertically)
+                rk_q = (
+                    session.query(
+                        SDTMColumn.source_file_id.label("sfid"),
+                        SDTMData.row_index.label("ri"),
+                    )
+                    .join(SDTMData, SDTMData.sdtm_column_id == SDTMColumn.id)
+                    .join(SDTMVariable, SDTMVariable.id == SDTMColumn.sdtm_variable_id)
+                    .join(SDTMDomain, SDTMDomain.id == SDTMVariable.domain_id)
+                    .filter(
+                        SDTMColumn.mapping_schema_id == mapping_schema_id,
+                        SDTMDomain.name == dom,
+                    )
+                    .distinct()
+                )
                 if source_file_id is not None:
-                    ri_q = ri_q.filter(SDTMData.source_file_id == source_file_id)
-                if filtered_rows_subq is not None:
-                    ri_q = ri_q.filter(SDTMData.row_index.in_(filtered_rows_subq))
+                    rk_q = rk_q.filter(SDTMColumn.source_file_id == source_file_id)
+                if filtered_keys_subq is not None:
+                    rk_q = rk_q.join(
+                        filtered_keys_subq,
+                        and_(
+                            filtered_keys_subq.c.sfid == SDTMColumn.source_file_id,
+                            filtered_keys_subq.c.ri == SDTMData.row_index,
+                        ),
+                    )
+                rk_q = rk_q.order_by(SDTMColumn.source_file_id.asc(), SDTMData.row_index.asc())
+                rk_q = rk_q.offset(offset).limit(limit)
+                row_keys = [(r.sfid, r.ri) for r in rk_q.all()]
 
-                row_indices = [
-                    r.row_index
-                    for r in ri_q.distinct().order_by(SDTMData.row_index.asc()).offset(offset).limit(limit).all()
-                ]
-
-            # ---------- total (respect filters) ----------
-            if filtered_rows_subq is not None:
-                total_count = session.query(func.count()).select_from(filtered_rows_subq).scalar()
+            # ---------- total (distinct (sfid, ri) across scope, respecting filters) ----------
+            if filtered_keys_subq is not None:
+                total_count = session.query(func.count()).select_from(filtered_keys_subq).scalar()
             else:
-                total_q = session.query(SDTMData.row_index).filter(SDTMData.domain == domain)
-                if mapping_schema_id:
-                    total_q = total_q.filter(SDTMData.mapping_schema_id == mapping_schema_id)
+                total_q = (
+                    session.query(SDTMColumn.source_file_id, SDTMData.row_index)
+                    .join(SDTMData, SDTMData.sdtm_column_id == SDTMColumn.id)
+                    .join(SDTMVariable, SDTMVariable.id == SDTMColumn.sdtm_variable_id)
+                    .join(SDTMDomain, SDTMDomain.id == SDTMVariable.domain_id)
+                    .filter(
+                        SDTMColumn.mapping_schema_id == mapping_schema_id,
+                        SDTMDomain.name == dom,
+                    )
+                    .distinct()
+                )
                 if source_file_id is not None:
-                    total_q = total_q.filter(SDTMData.source_file_id == source_file_id)
-                total_count = total_q.distinct().count()
+                    total_q = total_q.filter(SDTMColumn.source_file_id == source_file_id)
+                total_count = total_q.count()
 
-            if not row_indices:
+            if not row_keys:
                 return {"cols": cols, "rows": [], "total": total_count}, 200
 
-            # ---------- fetch cells ----------
-            data_q = session.query(SDTMData).filter(SDTMData.domain == domain, SDTMData.row_index.in_(row_indices))
-            if mapping_schema_id:
-                data_q = data_q.filter(SDTMData.mapping_schema_id == mapping_schema_id)
-            if source_file_id is not None:
-                data_q = data_q.filter(SDTMData.source_file_id == source_file_id)
-            entries = data_q.all()
+            # ---------- fetch cells for selected (sfid, ri) and shape rows ----------
+            # We filter by tuple (sfid, ri)
+            entries = (
+                session.query(
+                    SDTMColumn.source_file_id.label("sfid"),
+                    SDTMData.row_index.label("ri"),
+                    SDTMVariable.name.label("var_name"),
+                    SDTMData.value,
+                )
+                .join(SDTMVariable, SDTMVariable.id == SDTMColumn.sdtm_variable_id)
+                .join(SDTMData, SDTMData.sdtm_column_id == SDTMColumn.id)
+                .join(SDTMDomain, SDTMDomain.id == SDTMVariable.domain_id)
+                .filter(
+                    SDTMColumn.mapping_schema_id == mapping_schema_id,
+                    SDTMDomain.name == dom,
+                )
+                .filter(tuple_(SDTMColumn.source_file_id, SDTMData.row_index).in_(row_keys))
+                .all()
+            )
 
+            # Build a quick lookup: (sfid, ri) -> {var_name: value}
             grouped = {}
-            for e in entries:
-                grouped.setdefault(e.row_index, {})[e.column_name] = e.value
+            for sfid_val, ri_val, var_name, val in entries:
+                grouped.setdefault((sfid_val, ri_val), {})[var_name] = val
 
+            # Final rows: stack per selected keys, fill missing vars with None
             rows = []
-            for idx in row_indices:
-                rec = grouped.get(idx, {})
-                rows.append({k: rec.get(k) for k in col_order})
+            for key in row_keys:
+                vals = grouped.get(key, {})
+                rows.append({vn: vals.get(vn) for vn in ordered_vars})
 
             return {"cols": cols, "rows": rows, "total": total_count}, 200
 
@@ -307,100 +375,223 @@ class SDTMService:
             session.close()
 
 
-    def get_sdtm_overview(self, domain: str, source_file_id: int | None, mapping_schema_id: int | None,
-                           stats: bool = False, top_k: int = 3):
+
+    def get_sdtm_overview(
+        self,
+        domain: str,
+        source_file_id: int | None,
+        mapping_schema_id: int,     # required
+        stats: bool = False,
+        top_k: int = 3,
+    ):
         session = Session()
         try:
-            # ---------- columns (prefer SDTMColumn) ----------
-            col_q = session.query(SDTMColumn).filter(SDTMColumn.domain == domain)
-            if mapping_schema_id:
-                col_q = col_q.filter(SDTMColumn.mapping_schema_id == mapping_schema_id)
-            if source_file_id is not None:
-                col_q = col_q.filter(SDTMColumn.source_file_id == source_file_id)
-            col_q = col_q.order_by(SDTMColumn.ordinal.asc().nullsfirst(), SDTMColumn.name.asc())
-            col_rows = col_q.all()
+            dom = (domain or "").upper().strip()
 
-            if col_rows:
-                columns = [
-                    {
-                        "name": c.name,
-                        "ordinal": c.ordinal,
-                        "data_type": (c.data_type or "text").lower(),
-                        "description": None,  # (optional) could be filled from SDTMVariable.label if you pass standard_id
+            # ----- headers (IG order) across the scope -----
+            hdr_q = (
+                session.query(
+                    SDTMColumn.id.label("col_id"),
+                    SDTMColumn.source_file_id.label("sfid"),
+                    SDTMVariable.name.label("var_name"),
+                    SDTMVariable.data_type.label("ig_type"),        # "Char"/"Num"
+                    SDTMVariable.variable_order.label("var_order"),
+                    SDTMVariable.label.label("var_label"),
+                )
+                .join(SDTMVariable, SDTMVariable.id == SDTMColumn.sdtm_variable_id)
+                .join(SDTMDomain, SDTMDomain.id == SDTMVariable.domain_id)
+                .filter(
+                    SDTMColumn.mapping_schema_id == mapping_schema_id,
+                    SDTMDomain.name == dom,
+                )
+            )
+            if source_file_id is not None:
+                hdr_q = hdr_q.filter(SDTMColumn.source_file_id == source_file_id)
+
+            hdr_rows = hdr_q.order_by(SDTMVariable.variable_order.asc(), SDTMVariable.name.asc()).all()
+            if not hdr_rows:
+                return {
+                    "domain": dom,
+                    "mapping_schema_id": mapping_schema_id,
+                    "source_file_id": source_file_id,
+                    "num_rows": 0,
+                    "num_columns": 0,
+                    "stats_included": False,
+                    "columns": [],
+                }
+
+            # Dedup columns by IG variable name; keep order/dtype/label
+            var_meta_by_name = {}
+            col_ids_by_var = {}   # var_name -> set of SDTMColumn.ids (across files)
+            for r in hdr_rows:
+                if r.var_name not in var_meta_by_name:
+                    dtype = "float" if (r.ig_type or "").lower().startswith("num") else "text"
+                    var_meta_by_name[r.var_name] = {
+                        "ordinal": r.var_order,
+                        "data_type": dtype,
+                        "label": r.var_label,
                     }
-                    for c in col_rows
-                ]
-                name_to_dtype = {c.name: (c.data_type or "text").lower() for c in col_rows}
-            else:
-                # Fallback to distinct column names in SDTMData for this scope
-                names_q = session.query(SDTMData.column_name).filter(SDTMData.domain == domain)
-                if mapping_schema_id:
-                    names_q = names_q.filter(SDTMData.mapping_schema_id == mapping_schema_id)
-                if source_file_id is not None:
-                    names_q = names_q.filter(SDTMData.source_file_id == source_file_id)
-                names = sorted({r.column_name for r in names_q.distinct().all()})
-                columns = [
-                    {"name": n, "ordinal": i, "data_type": "text", "description": None}
-                    for i, n in enumerate(names)
-                ]
-                name_to_dtype = {n: "text" for n in names}
+                col_ids_by_var.setdefault(r.var_name, set()).add(r.col_id)
 
-            # ---------- row count (distinct row_index for scope) ----------
-            total_q = session.query(SDTMData.row_index).filter(SDTMData.domain == domain)
-            if mapping_schema_id:
-                total_q = total_q.filter(SDTMData.mapping_schema_id == mapping_schema_id)
+            ordered_vars = sorted(var_meta_by_name.keys(), key=lambda n: var_meta_by_name[n]["ordinal"])
+            columns = [
+                {
+                    "name": vn,
+                    "ordinal": var_meta_by_name[vn]["ordinal"],
+                    "data_type": var_meta_by_name[vn]["data_type"],
+                    "description": var_meta_by_name[vn]["label"],
+                }
+                for vn in ordered_vars
+            ]
+            name_to_dtype = {vn: var_meta_by_name[vn]["data_type"] for vn in ordered_vars}
+
+            # ----- total rows (distinct row keys) -----
             if source_file_id is not None:
-                total_q = total_q.filter(SDTMData.source_file_id == source_file_id)
-            total_rows = total_q.distinct().count()
+                # single file → distinct row_index is fine
+                col_ids_all = [cid for s in col_ids_by_var.values() for cid in s]
+                total_rows = (
+                    session.query(SDTMData.row_index)
+                    .filter(SDTMData.sdtm_column_id.in_(col_ids_all))
+                    .distinct()
+                    .count()
+                )
+            else:
+                # across files → count distinct (source_file_id, row_index)
+                total_rows = session.query(
+                    func.count(
+                        func.distinct(
+                            tuple_(SDTMColumn.source_file_id, SDTMData.row_index)
+                        )
+                    )
+                ).select_from(
+                    SDTMColumn
+                ).join(
+                    SDTMVariable, SDTMVariable.id == SDTMColumn.sdtm_variable_id
+                ).join(
+                    SDTMDomain, SDTMDomain.id == SDTMVariable.domain_id
+                ).join(
+                    SDTMData, SDTMData.sdtm_column_id == SDTMColumn.id
+                ).filter(
+                    SDTMColumn.mapping_schema_id == mapping_schema_id,
+                    SDTMDomain.name == dom,
+                ).scalar() or 0
 
             result = {
-                "domain": domain,
+                "domain": dom,
                 "mapping_schema_id": mapping_schema_id,
                 "source_file_id": source_file_id,
                 "num_rows": total_rows,
                 "num_columns": len(columns),
                 "stats_included": bool(stats),
-                "columns": columns,  # stats will be flattened into each dict below
+                "columns": columns,
             }
 
             if not stats or total_rows == 0 or len(columns) == 0:
                 return result
 
-            # ---------- compute stats per column (pandas) ----------
-            engine = session.get_bind()
+            # ----- stats per variable (aggregate across all files if needed) -----
             for col in result["columns"]:
-                name = col["name"]
-                dtype = col.get("data_type") or name_to_dtype.get(name, "text")
+                vn = col["name"]
+                dtype = name_to_dtype.get(vn, "text")
+                col_ids = list(col_ids_by_var.get(vn, []))
+                if not col_ids:
+                    continue
 
-                df_col = pd.read_sql_query(
-                    """
-                    SELECT value
-                    FROM sdtm_data
-                    WHERE domain = %(domain)s
-                      AND column_name = %(col)s
-                      AND value IS NOT NULL
-                      {schema_filter}
-                      {file_filter}
-                    """.format(
-                        schema_filter="AND mapping_schema_id = %(msid)s" if mapping_schema_id else "",
-                        file_filter="AND source_file_id = %(sfid)s" if source_file_id is not None else "",
-                    ),
-                    con=engine,
-                    params={
-                        "domain": domain,
-                        "col": name,
-                        **({"msid": mapping_schema_id} if mapping_schema_id else {}),
-                        **({"sfid": source_file_id} if source_file_id is not None else {}),
-                    },
+                # Fetch values via ORM and build a Series (simplest cross-db way)
+                vals = (
+                    session.query(SDTMData.value)
+                    .filter(SDTMData.sdtm_column_id.in_(col_ids), SDTMData.value.isnot(None))
+                    .all()
                 )
+                ser = pd.Series([v for (v,) in vals], dtype="object")
 
-                ser = df_col["value"] if "value" in df_col.columns else pd.Series([], dtype="object")
-                # Reuse your raw compute_stats (flat dict) for identical math
                 col_stats = self.utilities.compute_stats(ser, total_rows, dtype, top_k)
-                col.update(col_stats)  # flatten: nulls/distinct/top/... on the column dict
+                col.update(col_stats)
 
             return result
 
         finally:
             session.close()
+
+
+    def get_mapped_domains(self, mapping_schema_id):
+        """
+        Aggregate mapped SDTM domains across all MappingSchemaSourceFile rows for a schema
+        by parsing mapping_json.domains[*].domain.
+
+        Returns:
+        {
+          "mapping_schema_id": 7,
+          "standard_id": 123,
+          "domains": [
+            {"code": "VS", "label": "Vital Signs", "known_in_standard": true, "source_file_ids": [147, 148]},
+            ...
+          ]
+        }
+        """
+        session = Session()
+        try:
+            ms = session.get(MappingSchema, mapping_schema_id)
+            if not ms:
+                return {"error": "Mapping schema not found", "status": 404}
+
+            # Pull all link rows with mapping_json
+            links = (
+                session.query(MappingSchemaSourceFile.source_file_id, MappingSchemaSourceFile.mapping_json)
+                .filter(MappingSchemaSourceFile.mapping_schema_id == mapping_schema_id)
+                .all()
+            )
+
+            domain_to_sources = defaultdict(set)
+
+            for sfid, mj in links:
+                if not mj:
+                    continue
+                domains_cfg = mj.get("domains") or []
+                if not isinstance(domains_cfg, list):
+                    continue
+                for dcfg in domains_cfg:
+                    code = str((dcfg or {}).get("domain", "")).strip().upper()
+                    if not code:
+                        continue
+                    domain_to_sources[code].add(sfid)
+
+            codes = sorted(domain_to_sources.keys())
+
+            # validate codes against the schema's SDTM standard and attach labels
+            label_by_code = {}
+            known_set = set()
+            
+            # validate
+            dom_rows = (
+                session.query(SDTMDomain.name, SDTMDomain.label)
+                .filter(SDTMDomain.standard_id == ms.sdtm_standard_id,
+                        SDTMDomain.name.in_(codes))
+                .all()
+            )
+            for name, label in dom_rows:
+                label_by_code[name] = label
+                known_set.add(name)
+
+            # Build response list
+            domains_out = []
+            for code in codes:
+                entry = {
+                    "code": code,
+                    "label": label_by_code.get(code),              # None if unknown or not validating
+                    "known_in_standard": (code in known_set),
+                    "source_file_ids": sorted(domain_to_sources[code]),
+                }
+                domains_out.append(entry)
+
+            return {
+                "mapping_schema_id": mapping_schema_id,
+                "standard_id": ms.sdtm_standard_id,
+                "domains": domains_out,
+            }
+
+        finally:
+            session.close()
+
+
 

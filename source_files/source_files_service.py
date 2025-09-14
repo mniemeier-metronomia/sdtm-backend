@@ -32,10 +32,10 @@ class SourceFilesService:
             if not sf:
                 raise ValueError("Source file not found.")
 
-            # base payload + column list
+            # ---- base payload + ordered column list
             col_rows = (
                 session.query(SourceColumn)
-                .filter_by(source_file_id=source_file_id, variant="raw")
+                .filter_by(source_file_id=source_file_id)
                 .order_by(SourceColumn.ordinal.asc())
                 .all()
             )
@@ -48,56 +48,57 @@ class SourceFilesService:
             if not stats:
                 return result
 
-            total_rows_hint = sf.num_rows or 0
+            # maps for quick lookup
+            name_to_id = {c.name: c.id for c in col_rows}
+            name_to_dtype = {c.name: c.data_type for c in col_rows}
 
-            # Decide source: have we exploded to source_data?
+            # ---- do we have materialized source_data?
             has_source_data = (
                 session.query(SourceData.id)
-                .filter_by(source_file_id=source_file_id, variant="raw")
+                .filter_by(source_file_id=source_file_id)
                 .limit(1)
                 .first()
                 is not None
             )
 
             if has_source_data:
-                # Always pandas, but build per-column Series from DB (no wide pivot)
-                engine = session.get_bind()
-                total_rows = total_rows_hint
-                if not total_rows:
-                    # Cheap count for accuracy if missing
-                    total_rows = session.execute(
-                        """
-                        SELECT COALESCE(MAX(row_index)+1, 0) AS n
-                        FROM source_data
-                        WHERE source_file_id = :sfid AND variant = 'raw'
-                        """,
+                # Estimate total rows; if unknown, compute from row_index
+                total_rows = sf.num_rows or (
+                    session.execute(
+                        "SELECT COALESCE(MAX(row_index)+1, 0) FROM source_data WHERE source_file_id = :sfid",
                         {"sfid": sf.id},
                     ).scalar() or 0
+                )
 
-                # Compute stats per column — FLATTEN into column dict
+                engine = session.get_bind()
+
+                # Compute stats per column using source_column_id (no column_name anymore)
                 for col in result["columns"]:
-                    name = col["name"]
+                    col_name = col["name"]
+                    col_id = name_to_id[col_name]
+
                     df_col = pd.read_sql_query(
                         """
-                        SELECT value
-                        FROM source_data
-                        WHERE source_file_id = %(sfid)s
-                        AND variant = 'raw'
-                        AND column_name = %(col)s
-                        AND value IS NOT NULL
+                        SELECT sd.value
+                        FROM source_data sd
+                        WHERE sd.source_file_id = %(sfid)s
+                        AND sd.source_column_id = %(colid)s
+                        AND sd.value IS NOT NULL
                         """,
                         con=engine,
-                        params={"sfid": sf.id, "col": name},
+                        params={"sfid": sf.id, "colid": col_id},
                     )
+
                     ser = df_col["value"] if "value" in df_col.columns else pd.Series([], dtype="object")
-                    col_stats = self.utilities.compute_stats(ser, total_rows, col.get("data_type"), top_k)
-                    col.update(col_stats)  # <-- flatten, no "stats" key
+                    dtype = name_to_dtype.get(col_name)
+                    col_stats = self.utilities.compute_stats(ser, total_rows, dtype, top_k)
+                    col.update(col_stats)  # flatten into the column dict
+
                 return result
 
-            # Fallback: read LO → pandas
-            connection = session.connection()
-            raw_conn = connection.connection
-            with raw_conn.cursor():
+            # ---- Fallback: read the original large object into pandas
+            raw_conn = session.connection().connection
+            with raw_conn.cursor() as _:
                 lo = raw_conn.lobject(sf.file_oid, mode="rb")
                 content = lo.read()
                 lo.close()
@@ -106,16 +107,16 @@ class SourceFilesService:
             result["num_rows"] = len(df)
             result["num_columns"] = len(df.columns)
 
-            # Stats for known columns — FLATTEN into column dict
+            # Stats for known columns
             known = {c["name"]: c for c in result["columns"]}
             for name, meta in known.items():
                 if name in df.columns:
                     col_stats = self.utilities.compute_stats(df[name], len(df), meta.get("data_type"), top_k)
-                    meta.update(col_stats)  # <-- flatten
+                    meta.update(col_stats)
                     if meta.get("description") is None:
                         meta["description"] = col_desc.get(name)
 
-            # Add any file-only columns not yet in SourceColumn (already flattened in your code)
+            # Add any file-only columns not yet in SourceColumn
             for name in map(str, df.columns):
                 if name not in known:
                     dtype = self.utilities.infer_data_type(df[name])
@@ -125,13 +126,14 @@ class SourceFilesService:
                         "ordinal": len(result["columns"]),
                         "data_type": dtype,
                         "description": col_desc.get(name),
-                        **col_stats,  # already flattened
+                        **col_stats,
                     })
 
             return result
 
         finally:
             session.close()
+
 
        
 
@@ -222,99 +224,93 @@ class SourceFilesService:
     def generate_source_data(self, source_file_id):
         session = Session()
         try:
-            source_file = session.query(SourceFile).get(source_file_id)
-            if not source_file:
+            sf = session.get(SourceFile, source_file_id)
+            if not sf:
                 raise ValueError("Source file not found")
 
-            # wipe previous
-            session.query(SourceData).filter(SourceData.source_file_id == source_file_id).delete()
-            session.query(SourceColumn).filter(SourceColumn.source_file_id == source_file_id).delete()
+            # wipe previous (SourceData first to satisfy FK)
+            session.query(SourceData).filter_by(source_file_id=source_file_id).delete()
+            session.query(SourceColumn).filter_by(source_file_id=source_file_id).delete()
 
             # read large object -> DataFrame
             raw_conn = session.connection().connection
-            with raw_conn.cursor() as cursor:
-                lo = raw_conn.lobject(source_file.file_oid, mode='rb')
+            with raw_conn.cursor() as cur:
+                lo = raw_conn.lobject(sf.file_oid, mode="rb")
                 content = lo.read()
                 lo.close()
 
             df, col_descriptions = self.utilities.load_dataframe(
-                content, source_file.content_type, source_file.name
+                content, sf.content_type, sf.name
             )
 
-            raw_columns = source_file.included_columns
+            raw_columns = sf.included_columns or list(df.columns)
+            # keep only columns that actually exist, preserve order
+            raw_columns = [c for c in raw_columns if c in df.columns]
 
-            # ---- normalize dtypes up-front (so ints aren't 1.0) ----
-            df = df.convert_dtypes()  # StringDtype/Int64/boolean where possible
+            # ---- normalize dtypes (avoid 1.0 for ints) ----
+            df = df.convert_dtypes()
             for col in raw_columns:
                 s = df[col]
-                # if it's float but all non-null values are whole numbers, coerce to nullable Int64
                 if pd.api.types.is_float_dtype(s):
                     s_nonnull = s.dropna().astype(float)
                     if len(s_nonnull) and (s_nonnull % 1 == 0).all():
                         df[col] = pd.to_numeric(s, errors="coerce").astype("Int64")
 
-            # ---- build SourceColumn + per-column serializer ----
-            serializers = {}  # column_name -> function(value) -> string|None
+            # ---- create SourceColumn + serializers ----
+            serializers = {}
+            column_objs = []
             for i, col in enumerate(raw_columns):
                 series = df[col]
-                dtype = self.utilities.infer_data_type(series)  # e.g. "int", "int?", "float", "datetime", "bool", "string"
-
-                # sample values as strings (avoid 1.0)
-                sample_values = series.dropna().astype(str).unique().tolist()[:10]
-
-                session.add(SourceColumn(
-                    source_file_id=source_file.id,
+                dtype = self.utilities.infer_data_type(series)  # "int","int?","float","datetime","bool","string"
+                column_objs.append(SourceColumn(
+                    source_file_id=sf.id,
                     name=col,
                     data_type=dtype,
                     ordinal=i,
-                    sample_values=sample_values,
-                    variant="raw",
-                    description=col_descriptions.get(col)
+                    description=col_descriptions.get(col),
                 ))
 
                 base = dtype.rstrip("?")
-
                 if base == "int":
-                    def _ser(v):
-                        if pd.isna(v): return None
-                        return str(int(v))  # v is Int64 / py int now
-                    serializers[col] = _ser
-
+                    def _ser(v): return None if pd.isna(v) else str(int(v))
                 elif base == "float":
                     def _ser(v):
                         if pd.isna(v): return None
                         f = float(v)
                         return str(int(f)) if f.is_integer() else "{:.15g}".format(f)
-                    serializers[col] = _ser
-
                 elif base == "datetime":
-                    def _ser(v):
-                        if pd.isna(v): return None
-                        return pd.to_datetime(v).isoformat()
-                    serializers[col] = _ser
-
+                    def _ser(v): return None if pd.isna(v) else pd.to_datetime(v).isoformat()
                 elif base == "bool":
-                    def _ser(v):
-                        if pd.isna(v): return None
-                        return "true" if bool(v) else "false"
-                    serializers[col] = _ser
+                    def _ser(v): return None if pd.isna(v) else ("true" if bool(v) else "false")
+                else:
+                    def _ser(v): return None if pd.isna(v) else str(v)
+                serializers[col] = _ser
 
-                else:  # string / fallback
-                    def _ser(v):
-                        return None if pd.isna(v) else str(v)
-                    serializers[col] = _ser
+            session.add_all(column_objs)
+            session.flush()  # assign IDs to column_objs
 
-            # ---- write SourceData using the serializers ----
-            for row_idx, row in df[raw_columns].iterrows():
-                for col in raw_columns:
-                    sval = serializers[col](row[col])
-                    session.add(SourceData(
-                        source_file_id=source_file.id,
-                        row_index=int(row_idx),
-                        column_name=col,
+            col_id_by_name = {c.name: c.id for c in column_objs}
+
+            # ---- write SourceData (bulk) ----
+            objs = []
+            CHUNK = 5000
+            for row in df[raw_columns].itertuples(index=True, name=None):
+                row_idx = int(row[0])
+                values = row[1:]
+                for col, val in zip(raw_columns, values):
+                    sval = serializers[col](val)
+                    objs.append(SourceData(
+                        source_file_id=sf.id,
+                        row_index=row_idx,
                         value=sval,
-                        variant="raw"
+                        source_column_id=col_id_by_name[col],
                     ))
+                if len(objs) >= CHUNK:
+                    session.bulk_save_objects(objs)
+                    objs.clear()
+
+            if objs:
+                session.bulk_save_objects(objs)
 
             session.commit()
             return {"status": "success"}
@@ -327,27 +323,36 @@ class SourceFilesService:
             session.close()
 
 
-
     def get_source_data(self, source_file_id, offset=0, limit=100, sort_by=None, sort_dir="asc", filters=None):
         session = Session()
         try:
-            source_file = session.query(SourceFile).filter_by(id=source_file_id).first()
+            source_file = session.get(SourceFile, source_file_id)
             if not source_file:
                 return {"error": "Source file not found"}, 404
 
             # ---- columns metadata (ordered)
             col_rows = (
                 session.query(SourceColumn)
-                .filter_by(source_file_id=source_file_id, variant="raw")
+                .filter_by(source_file_id=source_file_id)
                 .order_by(SourceColumn.ordinal.asc())
                 .all()
             )
+            # maps & ordered lists
             cols = []
             name_to_base = {}
+            name_to_id = {}
+            id_to_name = {}
+            col_ids_in_order = []
+            col_names_in_order = []
+
             for c in col_rows:
                 base, nullable = self.utilities.canon_dtype(c.data_type)
                 cols.append({"name": c.name, "data_type": base, "nullable": nullable, "ordinal": c.ordinal})
                 name_to_base[c.name] = base
+                name_to_id[c.name] = c.id
+                id_to_name[c.id] = c.name
+                col_ids_in_order.append(c.id)
+                col_names_in_order.append(c.name)
 
             # guard: if sort_by not a known column, disable sorting
             if sort_by and sort_by not in name_to_base:
@@ -358,66 +363,72 @@ class SourceFilesService:
             active_filters = []
             for f in filters:
                 col = (f or {}).get("col")
-                text = (f or {}).get("filter_text", "")
-                if not col or col not in name_to_base:
+                text = str((f or {}).get("filter_text", "")).strip()
+                if not col or col not in name_to_id or text == "":
                     continue
-                text = str(text).strip()
-                if text == "":
-                    continue
-                active_filters.append({"col": col, "text": text})
+                active_filters.append({"col_id": name_to_id[col], "text": text})
 
             # helper to escape % and _ so they’re treated literally
             def _escape_like(s: str) -> str:
                 return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
             # Subquery of matching row_index values if filters are present.
-            # Logic: rows must match ALL filters (one per column), so:
-            # WHERE (col=a AND value ILIKE %x%) OR (col=b AND value ILIKE %y%) ...
-            # GROUP BY row_index HAVING COUNT(DISTINCT column_name) = len(active_filters)
+            # Rows must match ALL filters (one per column):
+            # GROUP BY row_index HAVING COUNT(DISTINCT source_column_id) = N
             filtered_rows_subq = None
             if active_filters:
                 or_clauses = []
                 for f in active_filters:
                     pattern = f"%{_escape_like(f['text'])}%"
                     or_clauses.append(and_(
-                        SourceData.column_name == f["col"],
+                        SourceData.source_column_id == f["col_id"],
                         SourceData.value.ilike(pattern, escape="\\"),
                     ))
                 filtered_rows_q = (
                     session.query(SourceData.row_index)
-                    .filter_by(source_file_id=source_file_id, variant="raw")
+                    .filter(SourceData.source_file_id == source_file_id)
                     .filter(or_(*or_clauses))
                     .group_by(SourceData.row_index)
-                    .having(func.count(func.distinct(SourceData.column_name)) == len(active_filters))
+                    .having(func.count(func.distinct(SourceData.source_column_id)) == len(active_filters))
                 )
                 filtered_rows_subq = filtered_rows_q.subquery()
 
             # ---- decide row indices (paging + optional sort), respecting filters
             if sort_by:
-                base = name_to_base.get(sort_by, "string")
-                sort_value_expr = SourceData.value
-                if base == "int":
-                    sort_value_expr = cast(SourceData.value, Integer)
-                elif base == "float":
-                    sort_value_expr = cast(SourceData.value, Float)
-                elif base == "datetime":
-                    sort_value_expr = cast(SourceData.value, DateTime)
-                elif base == "bool":
-                    sort_value_expr = cast(SourceData.value, Boolean)
+                sort_col_id = name_to_id.get(sort_by)
+                if sort_col_id is None:
+                    sort_by = None
+                else:
+                    base = name_to_base.get(sort_by, "string")
+                    sort_value_expr = SourceData.value
+                    if base == "int":
+                        sort_value_expr = cast(SourceData.value, Integer)
+                    elif base == "float":
+                        sort_value_expr = cast(SourceData.value, Float)
+                    elif base == "datetime":
+                        sort_value_expr = cast(SourceData.value, DateTime)
+                    elif base == "bool":
+                        sort_value_expr = cast(SourceData.value, Boolean)
 
-                sort_order = sort_value_expr.desc().nullslast() if sort_dir == "desc" else sort_value_expr.asc().nullsfirst()
+                    sort_order = sort_value_expr.desc().nullslast() if sort_dir == "desc" \
+                                else sort_value_expr.asc().nullsfirst()
 
+                    row_index_query = (
+                        session.query(SourceData.row_index)
+                        .filter(
+                            SourceData.source_file_id == source_file_id,
+                            SourceData.source_column_id == sort_col_id,
+                        )
+                    )
+                    if filtered_rows_subq is not None:
+                        row_index_query = row_index_query.filter(SourceData.row_index.in_(filtered_rows_subq))
+                    row_index_query = row_index_query.order_by(
+                        sort_order, SourceData.row_index.asc()
+                    ).offset(offset).limit(limit)
+            if not sort_by:
                 row_index_query = (
                     session.query(SourceData.row_index)
-                    .filter_by(source_file_id=source_file_id, variant="raw", column_name=sort_by)
-                )
-                if filtered_rows_subq is not None:
-                    row_index_query = row_index_query.filter(SourceData.row_index.in_(filtered_rows_subq))
-                row_index_query = row_index_query.order_by(sort_order, SourceData.row_index.asc()).offset(offset).limit(limit)
-            else:
-                row_index_query = (
-                    session.query(SourceData.row_index)
-                    .filter_by(source_file_id=source_file_id, variant="raw")
+                    .filter(SourceData.source_file_id == source_file_id)
                     .distinct()
                 )
                 if filtered_rows_subq is not None:
@@ -432,7 +443,7 @@ class SourceFilesService:
             else:
                 total_count = (
                     session.query(SourceData.row_index)
-                    .filter_by(source_file_id=source_file_id, variant="raw")
+                    .filter(SourceData.source_file_id == source_file_id)
                     .distinct()
                     .count()
                 )
@@ -440,27 +451,31 @@ class SourceFilesService:
             if not row_indices:
                 return {"cols": cols, "rows": [], "total": total_count}, 200
 
-            # ---- fetch the cells for those rows
+            # ---- fetch the cells for those rows (select only what you need)
             raw_rows = (
-                session.query(SourceData)
-                .filter_by(source_file_id=source_file_id, variant="raw")
-                .filter(SourceData.row_index.in_(row_indices))
+                session.query(SourceData.row_index, SourceData.source_column_id, SourceData.value)
+                .filter(
+                    SourceData.source_file_id == source_file_id,
+                    SourceData.row_index.in_(row_indices),
+                )
                 .all()
             )
 
             # ---- group into records; preserve column order
             grouped = {}
-            for e in raw_rows:
-                grouped.setdefault(e.row_index, {})[e.column_name] = e.value
+            for row_index, col_id, val in raw_rows:
+                grouped.setdefault(row_index, {})[col_id] = val
 
-            col_order = [c["name"] for c in cols]
             rows = []
             for idx in row_indices:
                 rec_src = grouped.get(idx, {})
-                rows.append({k: rec_src.get(k) for k in col_order})
+                # build with names in display order
+                row_obj = {name: rec_src.get(col_id) for name, col_id in zip(col_names_in_order, col_ids_in_order)}
+                rows.append(row_obj)
 
             return {"cols": cols, "rows": rows, "total": total_count}, 200
 
         finally:
             session.close()
+
 
