@@ -67,8 +67,25 @@ def ui_mods_to_server_ops(ui_mods):
         elif t == "trim":
             ops.append({"op": "trim"})
 
+        elif t == "unit_convert":
+            ops.append({
+                "op": "unit_convert",
+                "rule": p.get("rule", ""),     # "(x * 9/5) + 32"
+                "round": p.get("round"),       # int or None
+                "where": p.get("where"),         # rule/group object for row masking
+                # 'from'/'to' are UI hints only
+            })
+
+        elif t == "format":
+            ops.append({
+                "op": "format",
+                "fmt": p.get("fmt", "{:.1f}"),
+                "na": p.get("na", None),
+                "where": p.get("where"),
+            })
+
         else:
-            # e.g., substring_scan / concat (not per-column), or unknown
+            # e.g. substring_scan / concat (not per-column), or unknown
             ignored.append(t)
 
     return ops, ignored

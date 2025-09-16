@@ -27,6 +27,7 @@ class PreviewModsService:
             return [where.get("field")] if where.get("field") else []
         return []
 
+
     def _needed_cols_from_assign(self, assign):
         mode = (assign.get("mode") or "static").lower()
         val = assign.get("value") or ""
@@ -60,11 +61,14 @@ class PreviewModsService:
         )
         return {name: dtype for (name, dtype) in rows}
 
+
     def _load_source_subset(self, session, source_file_id: int, needed_cols, max_rows: int) -> pd.DataFrame:
         # sample row_index deterministically
         row_idx_stmt = (
-            select(distinct(SourceData.row_index))
-            .where(SourceData.source_file_id == source_file_id)
+            select(SourceData.row_index)
+            .join(SourceColumn, SourceColumn.id == SourceData.source_column_id)
+            .where(SourceColumn.source_file_id == source_file_id)
+            .distinct()
             .order_by(asc(SourceData.row_index))
             .limit(max_rows)
         )
@@ -73,27 +77,36 @@ class PreviewModsService:
             return pd.DataFrame(columns=needed_cols or [])
 
         if not needed_cols:
+            # no columns needed, return an empty-frame with just index
             return pd.DataFrame(index=idx)
 
+        # fetch long form (row_index, column_name, value) via join
         long_stmt = (
-            select(SourceData.row_index, SourceData.column_name, SourceData.value)
+            select(
+                SourceData.row_index,
+                SourceColumn.name,      # <- use header name from SourceColumn
+                SourceData.value,
+            )
+            .join(SourceColumn, SourceColumn.id == SourceData.source_column_id)
             .where(
-                SourceData.source_file_id == source_file_id,
-                SourceData.column_name.in_(needed_cols),
+                SourceColumn.source_file_id == source_file_id,
+                SourceColumn.name.in_(needed_cols),
                 SourceData.row_index.in_(idx),
             )
         )
         rows = session.execute(long_stmt).all()
 
         by_index = {ri: {} for ri in idx}
-        for ri, col, val in rows:
-            by_index.setdefault(ri, {})[col] = val
+        for ri, col_name, val in rows:
+            by_index.setdefault(ri, {})[col_name] = val
 
         wide = pd.DataFrame.from_dict(by_index, orient="index").reindex(index=idx)
+        # ensure all requested columns exist
         for c in needed_cols:
             if c not in wide.columns:
                 wide[c] = pd.Series([None] * len(wide), index=wide.index)
         return wide[needed_cols]
+    
 
     def _top_counts(self, s: pd.Series, k: int = 20):
         vc = s.value_counts(dropna=False).head(k)
@@ -108,6 +121,7 @@ class PreviewModsService:
                 "pct": round((cnt / total * 100.0), 2) if total else 0.0,
             })
         return out
+
 
     def _sample_pairs(self, orig: pd.Series, trans: pd.Series, k: int = 25):
         df = pd.DataFrame({"original": orig, "transformed": trans})
@@ -147,13 +161,14 @@ class PreviewModsService:
 
             df_sub = df[mask]
 
-            # build base series from assign (raw, unmodified)
+            # base series from assign (raw, unmodified)
             base = self.utils.eval_assign_series(df_sub, assign)
             fb = assign.get("fallback")
             if fb:
                 base = self.utils.apply_fallback(base, df_sub, fb)
 
             ops, ignored = ui_mods_to_server_ops(mods)
+            # pass df_sub so per-mod conditions (when) and unit_convert can use row context
             out = self.mods.apply(base, ops)
 
             return {
