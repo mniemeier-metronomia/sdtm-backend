@@ -1,10 +1,19 @@
 # services/value_map_suggest_service.py
 import re
 import pandas as pd
-from sqlalchemy import select, distinct, asc, func, and_
-from db import Session, SourceData, SourceColumn, SDTMCodelist, SDTMCodelistTerm, SDTMDomain, SDTMVariable
+from sqlalchemy import select, asc, func
+from db import (
+    Session,
+    SourceData,
+    SourceColumn,
+    SDTMCodelist,
+    SDTMCodelistTerm,
+    SDTMDomain,
+    SDTMVariable,
+)
 from mapper.transformer_utils import TransformerUtils
 from source_files.source_files_utilities import SourceFilesUtilities
+
 
 class ValueMapSuggestService:
     def __init__(self):
@@ -13,13 +22,16 @@ class ValueMapSuggestService:
 
     # ---------- load helpers (source) ----------
     def _list_where_fields(self, where):
-        if not isinstance(where, dict): return []
+        if not isinstance(where, dict):
+            return []
         t = (where.get("type") or "").lower()
         if t == "group":
             out = []
-            for ch in where.get("children") or []: out.extend(self._list_where_fields(ch))
+            for ch in where.get("children") or []:
+                out.extend(self._list_where_fields(ch))
             return out
-        if t == "rule": return [where.get("field")] if where.get("field") else []
+        if t == "rule":
+            return [where.get("field")] if where.get("field") else []
         return []
 
     def _needed_cols_from_assign(self, assign):
@@ -29,8 +41,10 @@ class ValueMapSuggestService:
         if mode == "column" and val:
             cols.add(str(val))
         elif mode == "expression":
+            # tokens like {COL}
             for token in re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", val):
                 cols.add(token)
+            # also pick up bare identifiers (df.eval-style)
             for token in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", val):
                 cols.add(token)
         fb = assign.get("fallback")
@@ -53,34 +67,48 @@ class ValueMapSuggestService:
         return {name: dtype for (name, dtype) in rows}
 
     def _load_source_subset(self, session, source_file_id: int, needed_cols, max_rows: int) -> pd.DataFrame:
+        # sample row_index deterministically for *this source file*
         row_idx_stmt = (
-            select(distinct(SourceData.row_index))
-            .where(SourceData.source_file_id == source_file_id)
+            select(SourceData.row_index)
+            .join(SourceColumn, SourceColumn.id == SourceData.source_column_id)
+            .where(SourceColumn.source_file_id == source_file_id)
+            .distinct()
             .order_by(asc(SourceData.row_index))
             .limit(max_rows)
         )
         idx = [r[0] for r in session.execute(row_idx_stmt).all()]
         if not idx:
             return pd.DataFrame(columns=needed_cols or [])
+
         if not needed_cols:
             return pd.DataFrame(index=idx)
 
+        # fetch long form via join: (row_index, column_name, value)
         long_stmt = (
-            select(SourceData.row_index, SourceData.column_name, SourceData.value)
+            select(
+                SourceData.row_index,
+                SourceColumn.name,
+                SourceData.value,
+            )
+            .join(SourceColumn, SourceColumn.id == SourceData.source_column_id)
             .where(
-                SourceData.source_file_id == source_file_id,
-                SourceData.column_name.in_(needed_cols),
+                SourceColumn.source_file_id == source_file_id,
+                SourceColumn.name.in_(needed_cols),
                 SourceData.row_index.in_(idx),
             )
         )
         rows = session.execute(long_stmt).all()
+
         by_index = {ri: {} for ri in idx}
-        for ri, col, val in rows:
-            by_index.setdefault(ri, {})[col] = val
+        for ri, col_name, val in rows:
+            by_index.setdefault(ri, {})[col_name] = val
+
         wide = pd.DataFrame.from_dict(by_index, orient="index").reindex(index=idx)
+        # ensure all requested columns exist
         for c in needed_cols:
             if c not in wide.columns:
                 wide[c] = pd.Series([None] * len(wide), index=wide.index)
+
         return wide[needed_cols]
 
     # ---------- codelist helpers ----------
@@ -93,12 +121,18 @@ class ValueMapSuggestService:
         if max_date:
             return (
                 session.query(SDTMCodelist)
-                .filter(SDTMCodelist.nci_code == nci_code, SDTMCodelist.standard_date == max_date)
+                .filter(
+                    SDTMCodelist.nci_code == nci_code,
+                    SDTMCodelist.standard_date == max_date,
+                )
                 .one_or_none()
             )
         return (
             session.query(SDTMCodelist)
-            .filter(SDTMCodelist.nci_code == nci_code, SDTMCodelist.standard_date.is_(None))
+            .filter(
+                SDTMCodelist.nci_code == nci_code,
+                SDTMCodelist.standard_date.is_(None),
+            )
             .order_by(SDTMCodelist.id.desc())
             .first()
         )
@@ -109,20 +143,28 @@ class ValueMapSuggestService:
         if standard_id and domain and variable:
             dom = (
                 session.query(SDTMDomain)
-                .filter(SDTMDomain.standard_id == standard_id, func.lower(SDTMDomain.name) == func.lower(domain))
+                .filter(
+                    SDTMDomain.standard_id == standard_id,
+                    func.lower(SDTMDomain.name) == func.lower(domain),
+                )
                 .one_or_none()
             )
-            if not dom: return None
+            if not dom:
+                return None
             var = (
                 session.query(SDTMVariable)
-                .filter(SDTMVariable.domain_id == dom.id, func.lower(SDTMVariable.name) == func.lower(variable))
+                .filter(
+                    SDTMVariable.domain_id == dom.id,
+                    func.lower(SDTMVariable.name) == func.lower(variable),
+                )
                 .one_or_none()
             )
             return var.codelist if var and var.codelist else None
         return None
 
     def _normalize(self, s: str, trim=True, case_sensitive=False):
-        if s is None: return ""
+        if s is None:
+            return ""
         s2 = s.strip() if trim else s
         return s2 if case_sensitive else s2.lower()
 
@@ -150,17 +192,25 @@ class ValueMapSuggestService:
         return cl, idx
 
     # ---------- main ----------
-    def suggest(self, source_file_id: int, assign: dict, where: dict | None,
-                match_options: dict | None, top_n: int, max_rows: int,
-                standard_id: int | None = None,
-                domain: str | None = None,
-                variable: str | None = None):
+    def suggest(
+        self,
+        source_file_id: int,
+        assign: dict,
+        where: dict | None,
+        match_options: dict | None,
+        top_n: int,
+        max_rows: int,
+        standard_id: int | None = None,
+        domain: str | None = None,
+        variable: str | None = None,
+    ):
         session = Session()
         try:
             # figure out columns we need
             assigns_cols = self._needed_cols_from_assign(assign)
             where_cols = self._list_where_fields(where) if where else []
             needed_cols = sorted({*assigns_cols, *[c for c in where_cols if c]})
+
             df = self._load_source_subset(session, source_file_id, needed_cols, max_rows)
 
             col_types = self._col_types_map(session, source_file_id)
@@ -176,7 +226,14 @@ class ValueMapSuggestService:
 
             # collect from-values (top_n distinct)
             vc = base.value_counts(dropna=False).head(top_n)
-            from_values = [{"value": (None if pd.isna(v) else v), "display": ("" if pd.isna(v) else str(v)), "count": int(n)} for v, n in vc.items()]
+            from_values = [
+                {
+                    "value": (None if pd.isna(v) else v),
+                    "display": ("" if pd.isna(v) else str(v)),
+                    "count": int(n),
+                }
+                for v, n in vc.items()
+            ]
 
             # codelist resolution + index
             trim = bool(match_options.get("trim", True)) if match_options else True
@@ -205,14 +262,16 @@ class ValueMapSuggestService:
                 hit = syn_index.get(norm)
                 if hit:
                     to_val, match_type, term_code, raw_syn = hit
-                    suggestions.append({
-                        "from": raw,
-                        "from_display": disp,
-                        "to": to_val,
-                        "match_type": match_type,      # "submission" or "synonym"
-                        "term_code": term_code,
-                        "synonym_matched": raw_syn,    # only when match_type == "synonym"
-                    })
+                    suggestions.append(
+                        {
+                            "from": raw,
+                            "from_display": disp,
+                            "to": to_val,
+                            "match_type": match_type,  # "submission" or "synonym"
+                            "term_code": term_code,
+                            "synonym_matched": raw_syn,  # only when match_type == "synonym"
+                        }
+                    )
 
             return {
                 "from_values": from_values,
